@@ -1,0 +1,27 @@
+{
+    "code": 200,
+    "message": "成功",
+    "data": {
+        "sessions": [
+            {
+                "session_id": "2026051220401511bfbb0aa8aa43ada5",
+                "title": "今天天气如何"
+            },
+            {
+                "session_id": "2026050721550287c14563b9434cd1ad",
+                "title": "你有什么技能"
+            },
+            {
+                "session_id": "20260507214450a079b18dfb2447f191",
+                "title": "你好"
+            },
+            {
+                "session_id": "20260429142752435127937796427990",
+                "title": "今天天气如何"
+            }
+        ],
+        "user_id": "SHIJINWEI124"
+    },
+    "traceId": null,
+    "msg": null
+}

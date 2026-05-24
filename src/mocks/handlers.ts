@@ -1,5 +1,8 @@
 import { delay, http, HttpResponse } from 'msw'
 import type { Conversation, Message } from '../app/types/chat'
+import getSessionsFixture from '../../mock/geSessions?raw'
+import getSessionFixture from '../../mock/getSession?raw'
+import streamFixture from '../../mock/stream?raw'
 import { conversations, createId, getNowISO, messagesByConversation } from './data'
 
 function sortConversations() {
@@ -11,6 +14,47 @@ function buildAssistantReply(input: string) {
 }
 
 export const handlers = [
+  http.get('/api/getSessions', async () => {
+    await delay(120)
+    return HttpResponse.json(JSON.parse(getSessionsFixture))
+  }),
+
+  http.get('/api/getSession', async ({ request }) => {
+    await delay(120)
+    const url = new URL(request.url)
+    const sessionId = url.searchParams.get('sessionId')
+    const response = JSON.parse(getSessionFixture)
+
+    if (sessionId && response.data) {
+      response.data.sessionId = sessionId
+    }
+
+    return HttpResponse.json(response)
+  }),
+
+  http.post('/stream/chat', () => {
+    const encoder = new TextEncoder()
+    const blocks = streamFixture.split(/\r?\n\r?\n/).filter((block) => block.trim())
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        for (const block of blocks) {
+          controller.enqueue(encoder.encode(`${block}\n\n`))
+          await delay(45)
+        }
+
+        controller.close()
+      },
+    })
+
+    return new HttpResponse(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+      },
+    })
+  }),
+
   http.get('/api/conversations', async () => {
     await delay(180)
     sortConversations()

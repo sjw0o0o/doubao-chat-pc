@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import type { Message } from '../../app/types/chat'
+import LongPressCopySelect from '../common/LongPressCopySelect'
 import MarkdownContent from './MarkdownContent'
 
 type MessageListProps = {
@@ -23,8 +24,12 @@ export default function MessageList({ messages, loading }: MessageListProps) {
       {messages.map((message) => (
         <div key={message.id} className={`message-row ${message.role}`}>
           <div className={`message-bubble ${message.role}`}>
-            <MarkdownContent content={message.content} />
-            {message.pending ? <span className="message-status">发送中...</span> : null}
+            <LongPressCopySelect text={message.content} disabled={!message.content.trim()}>
+              <MarkdownContent content={message.content} />
+            </LongPressCopySelect>
+            {message.pending ? (
+              <span className="message-status">{message.role === 'assistant' ? '生成中...' : '发送中...'}</span>
+            ) : null}
           </div>
         </div>
       ))}

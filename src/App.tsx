@@ -1,7 +1,7 @@
-import ChatDesktopPage from './pages/ChatDesktopPage'
+import ChatMobilePage from './pages/ChatMobilePage'
 
 function App() {
-  return <ChatDesktopPage />
+  return <ChatMobilePage />
 }
 
 export default App

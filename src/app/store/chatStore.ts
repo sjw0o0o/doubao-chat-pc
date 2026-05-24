@@ -3,9 +3,12 @@ import {
   createConversation as apiCreateConversation,
   fetchConversations,
   fetchMessages,
+  fetchSession,
+  fetchSessions,
   sendMessage as apiSendMessage,
+  streamChat,
 } from '../api/chatApi'
-import type { Conversation, Message } from '../types/chat'
+import type { Conversation, Message, StreamDoneData } from '../types/chat'
 
 const STORAGE_KEY = 'doubao-chat-state-v1'
 
@@ -78,8 +81,28 @@ function savePersistedState(state: PersistedChatState) {
   )
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function createLocalConversation(title = '新会话'): Conversation {
+  const now = new Date().toISOString()
+
+  return {
+    id: `local-${Date.now()}`,
+    title,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function updateMessage(
+  messages: Message[],
+  messageId: string,
+  updater: (message: Message) => Message,
+) {
+  return messages.map((message) => (message.id === messageId ? updater(message) : message))
+}
+
+function getDoneResponse(data: unknown) {
+  if (typeof data !== 'object' || data === null) return ''
+  return ((data as StreamDoneData).response ?? '').trim()
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -90,32 +113,48 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activeConversationId: null,
   messagesByConversation: {},
 
-  // 初始化：优先恢复本地缓存，其次拉取远端会话。
+  // 初始化：优先读取后端会话列表，失败时再恢复本地缓存。
   initialize: async () => {
     if (get().initialized) return
 
-    const persisted = loadPersistedState()
-    // 命中缓存时直接恢复状态并结束初始化。
-    if (persisted && persisted.conversations.length > 0) {
-      const sorted = sortConversations(persisted.conversations)
-      const activeConversationId =
-        persisted.activeConversationId && sorted.some((item) => item.id === persisted.activeConversationId)
-          ? persisted.activeConversationId
-          : sorted[0]?.id ?? null
+    try {
+      const conversations = await fetchSessions()
+      const activeConversationId = conversations[0]?.id ?? null
 
       set({
         initialized: true,
-        conversations: sorted,
+        conversations,
         activeConversationId,
-        messagesByConversation: persisted.messagesByConversation,
+        messagesByConversation: {},
       })
+
+      if (activeConversationId) {
+        await get().loadMessages(activeConversationId)
+      }
+
       return
+    } catch {
+      const persisted = loadPersistedState()
+      if (persisted && persisted.conversations.length > 0) {
+        const sorted = sortConversations(persisted.conversations)
+        const activeConversationId =
+          persisted.activeConversationId && sorted.some((item) => item.id === persisted.activeConversationId)
+            ? persisted.activeConversationId
+            : sorted[0]?.id ?? null
+
+        set({
+          initialized: true,
+          conversations: sorted,
+          activeConversationId,
+          messagesByConversation: persisted.messagesByConversation,
+        })
+        return
+      }
     }
 
     const { conversations } = await fetchConversations()
     const sorted = sortConversations(conversations)
 
-    // 首次进入且无会话时，自动创建一个默认会话。
     if (sorted.length === 0) {
       await get().createConversation()
       set({ initialized: true })
@@ -129,19 +168,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadMessages: async (conversationId: string) => {
     const cachedMessages = get().messagesByConversation[conversationId]
-    // 已有缓存则不重复请求。
     if (cachedMessages) return
 
     set({ loadingMessages: true })
-    const { messages } = await fetchMessages(conversationId)
 
-    set((state) => ({
-      loadingMessages: false,
-      messagesByConversation: {
-        ...state.messagesByConversation,
-        [conversationId]: messages,
-      },
-    }))
+    try {
+      const messages = conversationId.startsWith('local-')
+        ? []
+        : await fetchSession(conversationId)
+
+      set((state) => ({
+        loadingMessages: false,
+        messagesByConversation: {
+          ...state.messagesByConversation,
+          [conversationId]: messages,
+        },
+      }))
+    } catch {
+      const { messages } = await fetchMessages(conversationId)
+
+      set((state) => ({
+        loadingMessages: false,
+        messagesByConversation: {
+          ...state.messagesByConversation,
+          [conversationId]: messages,
+        },
+      }))
+    }
   },
 
   // 切换会话：先更新激活会话，再按需懒加载消息。
@@ -154,103 +207,114 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  // 新建会话：插入列表并设为当前会话。
+  // 新建会话：后端不可用时创建本地会话，保证发送流程可继续。
   createConversation: async () => {
-    const { conversation } = await apiCreateConversation()
+    try {
+      const { conversation } = await apiCreateConversation()
 
-    set((state) => ({
-      conversations: sortConversations([conversation, ...state.conversations]),
-      activeConversationId: conversation.id,
-      messagesByConversation: {
-        ...state.messagesByConversation,
-        [conversation.id]: state.messagesByConversation[conversation.id] ?? [],
-      },
-    }))
+      set((state) => ({
+        conversations: sortConversations([conversation, ...state.conversations]),
+        activeConversationId: conversation.id,
+        messagesByConversation: {
+          ...state.messagesByConversation,
+          [conversation.id]: state.messagesByConversation[conversation.id] ?? [],
+        },
+      }))
+    } catch {
+      const conversation = createLocalConversation()
+
+      set((state) => ({
+        conversations: [conversation, ...state.conversations],
+        activeConversationId: conversation.id,
+        messagesByConversation: {
+          ...state.messagesByConversation,
+          [conversation.id]: [],
+        },
+      }))
+    }
   },
 
-  // 发送消息：先乐观插入用户消息，再用服务端结果回填。
+  // 发送消息：先乐观插入用户消息，再用 XHR 流式回填 assistant 内容。
   sendMessage: async (content: string) => {
     const text = content.trim()
-    if (!text) return
+    if (!text || get().sending) return
 
     let conversationId = get().activeConversationId
-    // 没有当前会话时先创建会话，保证后续发送有归属。
     if (!conversationId) {
       await get().createConversation()
       conversationId = get().activeConversationId
       if (!conversationId) return
     }
 
-    // 先插入临时消息，立即反馈发送状态。
-    const tempMessage: Message = {
-      id: `temp-${Date.now()}`,
+    const now = new Date().toISOString()
+    const userMessage: Message = {
+      id: `user-${Date.now()}`,
       conversationId,
       role: 'user',
       content: text,
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+    }
+    const assistantMessageId = `assistant-${Date.now()}`
+    const assistantMessage: Message = {
+      id: assistantMessageId,
+      conversationId,
+      role: 'assistant',
+      content: '',
+      createdAt: now,
       pending: true,
     }
 
-    set((state) => ({
-      sending: true,
-      messagesByConversation: {
-        ...state.messagesByConversation,
-        [conversationId]: [...(state.messagesByConversation[conversationId] ?? []), tempMessage],
-      },
-    }))
+    set((state) => {
+      const currentMessages = state.messagesByConversation[conversationId] ?? []
+      const conversations = state.conversations.map((conversation) =>
+        conversation.id === conversationId
+          ? {
+              ...conversation,
+              title: conversation.title === '新会话' ? text.slice(0, 20) || '新会话' : conversation.title,
+              updatedAt: now,
+            }
+          : conversation,
+      )
+
+      return {
+        sending: true,
+        conversations: sortConversations(conversations),
+        messagesByConversation: {
+          ...state.messagesByConversation,
+          [conversationId]: [...currentMessages, userMessage, assistantMessage],
+        },
+      }
+    })
 
     try {
-      const { conversation, userMessage, assistantMessage } = await apiSendMessage({
+      let finalResponse = ''
+
+      await streamChat({
         conversationId,
         content: text,
-      })
+        onEvent: ({ event, data }) => {
+          if (event === 'content' && typeof data === 'object' && data && 'chunk' in data) {
+            const chunk = String(data.chunk ?? '')
+            set((state) => {
+              const currentMessages = state.messagesByConversation[conversationId] ?? []
 
-      const streamMessageId = `stream-${assistantMessage.id}`
-
-      // 用真实 userMessage 替换临时消息，并挂载一个空的 assistant 流式消息。
-      set((state) => {
-        const currentMessages = state.messagesByConversation[conversationId] ?? []
-        const replacedMessages = currentMessages.map((item) =>
-          item.id === tempMessage.id ? userMessage : item,
-        )
-
-        return {
-          conversations: sortConversations(upsertConversation(state.conversations, conversation)),
-          messagesByConversation: {
-            ...state.messagesByConversation,
-            [conversationId]: [
-              ...replacedMessages,
-              {
-                ...assistantMessage,
-                id: streamMessageId,
-                content: '',
-                pending: true,
-              },
-            ],
-          },
-        }
-      })
-
-      const fullContent = assistantMessage.content
-      const chunkSize = 10
-
-      for (let index = chunkSize; index <= fullContent.length + chunkSize; index += chunkSize) {
-        const partial = fullContent.slice(0, index)
-
-        set((state) => {
-          const currentMessages = state.messagesByConversation[conversationId] ?? []
-          return {
-            messagesByConversation: {
-              ...state.messagesByConversation,
-              [conversationId]: currentMessages.map((item) =>
-                item.id === streamMessageId ? { ...item, content: partial } : item,
-              ),
-            },
+              return {
+                messagesByConversation: {
+                  ...state.messagesByConversation,
+                  [conversationId]: updateMessage(currentMessages, assistantMessageId, (message) => ({
+                    ...message,
+                    content: `${message.content}${chunk}`,
+                  })),
+                },
+              }
+            })
           }
-        })
 
-        await sleep(30)
-      }
+          if (event === 'done') {
+            finalResponse = getDoneResponse(data)
+          }
+        },
+      })
 
       set((state) => {
         const currentMessages = state.messagesByConversation[conversationId] ?? []
@@ -259,35 +323,52 @@ export const useChatStore = create<ChatState>((set, get) => ({
           sending: false,
           messagesByConversation: {
             ...state.messagesByConversation,
-            [conversationId]: currentMessages.map((item) =>
-              item.id === streamMessageId ? assistantMessage : item,
-            ),
+            [conversationId]: updateMessage(currentMessages, assistantMessageId, (message) => ({
+              ...message,
+              content: finalResponse || message.content,
+              pending: false,
+            })),
           },
         }
       })
     } catch {
-      const errorMessage: Message = {
-        id: `msg-error-${Date.now()}`,
-        conversationId,
-        role: 'assistant',
-        content: '抱歉，mock 服务暂时不可用，请稍后重试。',
-        createdAt: new Date().toISOString(),
+      try {
+        const { conversation, userMessage: realUserMessage, assistantMessage: realAssistantMessage } =
+          await apiSendMessage({ conversationId, content: text })
+
+        set((state) => {
+          const currentMessages = state.messagesByConversation[conversationId] ?? []
+
+          return {
+            sending: false,
+            conversations: sortConversations(upsertConversation(state.conversations, conversation)),
+            messagesByConversation: {
+              ...state.messagesByConversation,
+              [conversationId]: currentMessages.map((message) => {
+                if (message.id === userMessage.id) return realUserMessage
+                if (message.id === assistantMessageId) return realAssistantMessage
+                return message
+              }),
+            },
+          }
+        })
+      } catch {
+        set((state) => {
+          const currentMessages = state.messagesByConversation[conversationId] ?? []
+
+          return {
+            sending: false,
+            messagesByConversation: {
+              ...state.messagesByConversation,
+              [conversationId]: updateMessage(currentMessages, assistantMessageId, (message) => ({
+                ...message,
+                content: message.content || '抱歉，消息发送失败，请稍后重试。',
+                pending: false,
+              })),
+            },
+          }
+        })
       }
-
-      set((state) => {
-        const currentMessages = state.messagesByConversation[conversationId] ?? []
-        const replacedMessages = currentMessages.map((item) =>
-          item.id === tempMessage.id ? { ...item, pending: false } : item,
-        )
-
-        return {
-          sending: false,
-          messagesByConversation: {
-            ...state.messagesByConversation,
-            [conversationId]: [...replacedMessages, errorMessage],
-          },
-        }
-      })
     }
   },
 }))
