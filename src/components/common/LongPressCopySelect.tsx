@@ -1,4 +1,4 @@
-import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 type Point = {
@@ -29,6 +29,11 @@ type SelectionOverlay = {
 }
 
 type DragHandle = 'start' | 'end' | null
+
+type DragState = {
+  anchor: TextPosition
+  active: TextPosition
+} | null
 
 type LongPressCopySelectProps = {
   text: string
@@ -148,15 +153,6 @@ function getSelectionOverlay(selection: SelectionState, root: HTMLElement): Sele
   }
 }
 
-function applyNativeSelection(selection: SelectionState) {
-  const nativeSelection = window.getSelection()
-  if (!nativeSelection) return
-
-  const range = createRangeFromSelection(selection)
-  nativeSelection.removeAllRanges()
-  nativeSelection.addRange(range)
-}
-
 function getSelectionText(selection: SelectionState) {
   return createRangeFromSelection(selection).toString()
 }
@@ -274,6 +270,7 @@ export default function LongPressCopySelect({
   const [selectionState, setSelectionState] = useState<SelectionState | null>(null)
   const [selectionOverlay, setSelectionOverlay] = useState<SelectionOverlay | null>(null)
   const dragHandleRef = useRef<DragHandle>(null)
+  const dragStateRef = useRef<DragState>(null)
   const selecting = selectionState !== null
 
   function clearPressTimer() {
@@ -292,6 +289,7 @@ export default function LongPressCopySelect({
     setSelectionState(null)
     setSelectionOverlay(null)
     dragHandleRef.current = null
+    dragStateRef.current = null
   }
 
   function setCustomSelection(nextSelection: SelectionState) {
@@ -301,7 +299,6 @@ export default function LongPressCopySelect({
     const normalizedSelection = normalizeSelection(nextSelection.start, nextSelection.end)
     setSelectionState(normalizedSelection)
     setSelectionOverlay(getSelectionOverlay(normalizedSelection, root))
-    applyNativeSelection(normalizedSelection)
   }
 
   function openMenu(point: Point) {
@@ -334,76 +331,135 @@ export default function LongPressCopySelect({
 
   async function handleCopySelection() {
     const selectedText = selectionState ? getSelectionText(selectionState) : window.getSelection()?.toString() ?? ''
+    clearSelection()
     if (!selectedText.trim()) return
 
     await copyText(selectedText)
-    clearSelection()
   }
 
-  function startDragHandle(handle: DragHandle) {
+  function startDragHandle(handle: Exclude<DragHandle, null>) {
+    if (!selectionState) return
+
+    const anchor = handle === 'start' ? selectionState.end : selectionState.start
+    const active = handle === 'start' ? selectionState.start : selectionState.end
     dragHandleRef.current = handle
+    dragStateRef.current = { anchor, active }
   }
 
   const updateDragSelection = useCallback((point: Point) => {
     const root = rootRef.current
-    const selection = selectionState
-    const handle = dragHandleRef.current
-    if (!root || !selection || !handle) return
+    const dragState = dragStateRef.current
+    if (!root || !dragState) return
 
-    const position = getTextPositionFromPoint(root, point)
-    if (!position) return
+    const active = getTextPositionFromPoint(root, point)
+    if (!active) return
 
-    if (handle === 'start') {
-      setCustomSelection({ start: position, end: selection.end })
-      return
+    dragStateRef.current = {
+      ...dragState,
+      active,
     }
 
-    setCustomSelection({ start: selection.start, end: position })
-  }, [selectionState])
+    const normalizedSelection = normalizeSelection(dragState.anchor, active)
+    dragHandleRef.current = compareTextPosition(active, dragState.anchor) <= 0 ? 'start' : 'end'
+    setCustomSelection(normalizedSelection)
+  }, [])
 
   function stopDragHandle() {
     dragHandleRef.current = null
+    dragStateRef.current = null
   }
 
-  function handlePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
-    if (disabled || event.pointerType === 'mouse' && event.button !== 0) return
+  function startLongPress(point: Point) {
+    if (disabled) return
+
+    if (selectionState) {
+      clearSelection()
+      return
+    }
 
     clearPressTimer()
     longPressTriggeredRef.current = false
-    pressPointRef.current = { x: event.clientX, y: event.clientY }
+    pressPointRef.current = point
     pressTimerRef.current = window.setTimeout(() => {
       if (!pressPointRef.current) return
       openMenu(pressPointRef.current)
     }, longPressDelay)
   }
 
-  function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
-    const point = pressPointRef.current
-    if (!point) return
+  function cancelLongPress(point?: Point) {
+    const startPoint = pressPointRef.current
 
-    const distance = Math.hypot(event.clientX - point.x, event.clientY - point.y)
-    if (distance > MOVE_THRESHOLD) {
-      clearPressTimer()
-      pressPointRef.current = null
+    if (point && startPoint) {
+      const distance = Math.hypot(point.x - startPoint.x, point.y - startPoint.y)
+      if (distance <= MOVE_THRESHOLD) return
     }
-  }
 
-  function handlePointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
     clearPressTimer()
-
-    if (longPressTriggeredRef.current) {
-      event.preventDefault()
-      event.stopPropagation()
-    }
+    pressPointRef.current = null
   }
+
+  function handleMouseDown(event: ReactMouseEvent<HTMLDivElement>) {
+    if (event.button !== 0) return
+    startLongPress({ x: event.clientX, y: event.clientY })
+  }
+
+  function handleMouseMove(event: ReactMouseEvent<HTMLDivElement>) {
+    cancelLongPress({ x: event.clientX, y: event.clientY })
+  }
+
+  function handleMouseUp() {
+    clearPressTimer()
+  }
+
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+
+    function handleNativeTouchStart(event: TouchEvent) {
+      if (event.touches.length !== 1) return
+      const touch = event.touches[0]
+      startLongPress({ x: touch.clientX, y: touch.clientY })
+    }
+
+    function handleNativeTouchMove(event: TouchEvent) {
+      if (event.touches.length !== 1) return
+      const touch = event.touches[0]
+      cancelLongPress({ x: touch.clientX, y: touch.clientY })
+    }
+
+    function handleNativeTouchEnd() {
+      clearPressTimer()
+      if (!longPressTriggeredRef.current) {
+        pressPointRef.current = null
+      }
+    }
+
+    root.addEventListener('touchstart', handleNativeTouchStart, { passive: true })
+    root.addEventListener('touchmove', handleNativeTouchMove, { passive: true })
+    root.addEventListener('touchend', handleNativeTouchEnd, { passive: true })
+    root.addEventListener('touchcancel', handleNativeTouchEnd, { passive: true })
+
+    return () => {
+      root.removeEventListener('touchstart', handleNativeTouchStart)
+      root.removeEventListener('touchmove', handleNativeTouchMove)
+      root.removeEventListener('touchend', handleNativeTouchEnd)
+      root.removeEventListener('touchcancel', handleNativeTouchEnd)
+    }
+  })
 
   useEffect(() => {
     function handleDocumentPointerDown(event: PointerEvent) {
       const target = event.target as Node | null
       const root = rootRef.current
+      const element = target instanceof Element ? target : null
+
+      if (element?.closest('.long-press-selection-handle, .long-press-selected-copy-btn, .long-press-copy-menu')) {
+        return
+      }
 
       if (root && target && root.contains(target)) return
       closeMenu()
+      if (selectionState) clearSelection()
     }
 
     function handleSelectionChange() {
@@ -436,12 +492,15 @@ export default function LongPressCopySelect({
     }
 
     function handleScroll() {
+      clearPressTimer()
+      pressPointRef.current = null
       closeMenu()
       if (!selectionState) return
 
       const root = rootRef.current
       if (!root) return
       setSelectionOverlay(getSelectionOverlay(selectionState, root))
+      window.getSelection()?.removeAllRanges()
     }
 
     function handlePointerMove(event: PointerEvent) {
@@ -479,12 +538,15 @@ export default function LongPressCopySelect({
       <div
         ref={rootRef}
         className={`long-press-copy-select ${selecting ? 'selecting' : ''}`}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerEnd}
-        onPointerCancel={handlePointerEnd}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
         onContextMenu={(event) => {
-          if (!disabled) event.preventDefault()
+          if (disabled) return
+          event.preventDefault()
+          pressPointRef.current = { x: event.clientX, y: event.clientY }
+          openMenu(pressPointRef.current)
         }}
       >
         {children}
@@ -558,8 +620,8 @@ export default function LongPressCopySelect({
           onPointerDown={(event) => {
             event.preventDefault()
             event.stopPropagation()
+            void handleCopySelection()
           }}
-          onClick={handleCopySelection}
         >
           复制
         </button>

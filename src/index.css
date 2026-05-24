@@ -304,6 +304,7 @@ body,
   padding: 16px 14px 112px;
   background: #f6f7f9;
   overflow-y: auto;
+  touch-action: pan-y;
 }
 
 .mobile-chat-page .message-row {
@@ -523,17 +524,16 @@ body,
 
 .long-press-copy-select {
   position: relative;
-  -webkit-user-select: text;
-  user-select: text;
+  touch-action: pan-y;
 }
 
 .mobile-chat-page .long-press-copy-select {
-  -webkit-touch-callout: default;
+  -webkit-touch-callout: none;
   cursor: text;
 }
 
 .long-press-copy-select.selecting {
-  -webkit-touch-callout: default;
+  -webkit-touch-callout: none;
 }
 
 .long-press-copy-select ::selection {
